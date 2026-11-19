@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Nuxt local dependencies and generated files
+node_modules/
+.nuxt/
+.output/
+.sites-runtime/
+web/public/data/
+npm-debug.log*

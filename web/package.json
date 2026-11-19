@@ -1,0 +1,29 @@
+{
+  "name": "cosmo-collector-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev --host 127.0.0.1",
+    "build": "nuxt build",
+    "preview": "nuxt preview --host 127.0.0.1",
+    "postinstall": "nuxt prepare",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "nuxt": "^4.6.4",
+    "vue": "^3.0.0",
+    "vue-router": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "vue-tsc": "^3.0.0"
+  },
+  "overrides": {
+    "readdir-glob": {
+      "minimatch": "^11.0.9"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
