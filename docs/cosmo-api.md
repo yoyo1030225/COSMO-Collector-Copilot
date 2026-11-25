@@ -1,21 +1,21 @@
 # COSMO API 從哪裡找到？如何取得使用者紀錄？
 
-已完成「網頁輸入暱稱 → 官方查帳號 → 公開鏈上合約列出全部持有 → 官方取得卡片基本資料」的流程。2026-11-19 17:49（台北時間）透過網頁實測取得 719 張、564 款。持有清單直接來自 Abstract 的 Objekt 合約，這條流程不依賴 Apollo 網頁或其資料庫；轉送歷史尚未實作。
+已完成並實測「網頁輸入暱稱 → 官方查帳號 → 公開鏈上合約列出全部持有 → 官方取得卡片基本資料」的流程。個人帳號與實際收藏紀錄不記錄在公開範例中。持有清單直接來自 Abstract 的 Objekt 合約，這條流程不依賴 Apollo 網頁或其資料庫；轉送歷史尚未實作。
 
 ## 先跑一個小範例
 
 在專案根目錄執行：
 
 ```powershell
-python -X utf8 -c "from pprint import pprint; from cosmo import fetch_public_account; pprint(fetch_public_account('unproKPOPfan225'), sort_dicts=False)"
+python -X utf8 -c "from pprint import pprint; from cosmo import fetch_public_account; pprint(fetch_public_account(input('COSMO 暱稱：').strip()), sort_dicts=False)"
 ```
 
-成功時會得到兩個欄位：
+輸入自己的 COSMO 暱稱後，成功時會得到兩個欄位。以下是欄位示意，實際值由查詢結果決定：
 
 ```python
 {
-    'nickname': 'unproKPOPfan225',
-    'address': '0x75F3E9549397f98C536b8a70C51C4A201Da49C31'
+    'nickname': '<你輸入的暱稱>',
+    'address': '<官方回傳的錢包地址>'
 }
 ```
 
@@ -66,16 +66,16 @@ Proxy 是放在通訊路徑中的「中繼站」。使用 mitmproxy 觀察自己
 帳號查詢：
 
 ```text
-GET https://api.cosmo.fans/bff/v3/users/by-nickname/unproKPOPfan225
+GET https://api.cosmo.fans/bff/v3/users/by-nickname/<NICKNAME>
 ```
 
 單張卡片資料：
 
 ```text
-GET https://api.cosmo.fans/bff/v3/objekts/nft-metadata/31108630
+GET https://api.cosmo.fans/bff/v3/objekts/nft-metadata/<TOKEN_ID>
 ```
 
-單卡回應含 `name`、`image` 與 `attributes`。`attributes` 內的 `Artist`、`Member`、`Season`、`Collection`、`Class`，由 `cosmo.py` 轉成容易供網頁使用的欄位。V3 metadata 不是完整卡款資料模型；目前只使用實際存在且已驗證的基本欄位。
+請將 `<NICKNAME>` 與 `<TOKEN_ID>` 換成要查詢的暱稱及卡片 ID。單卡回應含 `name`、`image` 與 `attributes`。`attributes` 內的 `Artist`、`Member`、`Season`、`Collection`、`Class`，由 `cosmo.py` 轉成容易供網頁使用的欄位。V3 metadata 不是完整卡款資料模型；目前只使用實際存在且已驗證的基本欄位。
 
 這兩個查詢本次不需要登入 Cookie 或 Token。Apollo 原始碼中另有需要 token、session 或解密處理的查詢，不能把本次的公開讀取方式直接套用到所有介面。
 
@@ -113,15 +113,17 @@ COSMO ID
 ABI 是合約函式的介面描述，會說明函式名稱、參數與回傳值。`chain.py` 使用的是公開唯讀 `eth_call`：
 
 1. 取得本次的區塊號碼與雜湊，固定資料時點。
-2. `balanceOf(address)` 讀取持有張數，本次為 719。
-3. `tokenOfOwnerByIndex(address, index)` 從索引 0 到 718 逐張列出 Token ID；每批 50 個呼叫，依 JSON-RPC 的 id 還原順序。
-4. 確認筆數、唯一性及區塊仍一致，再取得所有卡片 metadata。
-5. 全部成功後才取代網頁快照；任一步失敗都保留上一份完整資料。
+2. `balanceOf(address)` 讀取持有總數 `total`。
+3. `tokenOfOwnerByIndex(address, index)` 從索引 0 到 `total - 1` 列出 Token ID。Multicall3 的 `aggregate3` 每次合併最多 200 個呼叫，同時查詢兩批。聚合結果不符或節點拒絕聚合時，會改查每批最多 50 筆的直接呼叫。
+4. 確認筆數、唯一性及區塊雜湊後，網頁先取得持有清單。後端重用連線，分批送出已取得的官方卡片 metadata。
+5. 卡片資料全部成功後，再核對區塊雜湊並保存完整快照。少數卡片資料缺少時，網頁仍可瀏覽已核對的持有清單。
 
-這些呼叫不會送出交易，也不需要登入 Cookie、私鑰或錢包簽名。本次另抽查首、中、末三張卡的 `ownerOf()`，均符合指定帳號的錢包。
+Multicall3 透過 `eth_call` 合併多個唯讀呼叫。Abstract 主網的部署地址為 `0xaa4de41dba0ca5dcbb288b7cc6b708f3aac759e7`。參考 [Abstract 部署定義](https://github.com/wevm/viem/blob/main/src/chains/definitions/abstract.ts) 與 [Multicall3 原始碼](https://github.com/mds1/multicall3/blob/main/src/Multicall3.sol)。
+
+這些呼叫不會送出交易，也不需要登入 Cookie、私鑰或錢包簽名。亦可用 `ownerOf()` 抽查卡片是否屬於指定的查詢錢包。
 
 持有資料每次都重新讀取；圖片與卡款 metadata 最多快取 24 小時，避免反覆查詢相同資料。快取按鏈、合約、Token ID 分開存放，不能將 Token ID 當成跨鏈的全域識別碼。目前完整性範圍是 Abstract 上這個 COSMO Objekt 合約，並非所有鏈、所有 NFT 合約的錢包資產。
 
-本範例設有每帳號 10,000 張的保護上限，超過時明確中止，不會產生部分快照。Unit 卡會保留例如 `S4 X S18` 的組合名稱，以及 `ChaeYeon`、`JooBin` 的個別成員，讓成員篩選仍能找到組合卡。
+程式已移除每帳號 10,000 張的人工上限，會按 `total` 完整查完所有批次；網頁每頁 60 張不影響取得總數。大量資料仍受網路、來源服務與記憶體影響，失敗不發布部分快照。Unit 卡會保留例如 `S4 X S18` 的組合名稱，以及 `ChaeYeon`、`JooBin` 的個別成員，讓成員篩選仍能找到組合卡。
 
-單卡 metadata 不會證明目前持有人。其名稱尾端的 `#31108630` 也不能當成已驗證的發行序號。本次網頁明確將 `31108630` 標示為 Token ID，不自行填入可傳送狀態、Grid 使用情況或發行序號。
+單卡 metadata 不會證明目前持有人。名稱尾端的數字也不能當成已驗證的發行序號。網頁會明確標示 Token ID，不自行填入可傳送狀態、Grid 使用情況或發行序號。

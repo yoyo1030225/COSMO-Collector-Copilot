@@ -1,6 +1,9 @@
-import type { CollectionJob } from '~/types/collection-job'
-import type { CollectionSnapshot } from '~/types/objekt'
-import { parseCollectionSnapshot } from '~/utils/collection'
+import type { CollectionJob, CollectionJobUpdate, CollectionPreview } from '~/types/collection-job'
+import type { CollectionSnapshot, Objekt } from '~/types/objekt'
+import { isCollectionAccount, isObjekt, parseCollectionSnapshot } from '~/utils/collection'
+
+const POLL_DELAY = 1000
+const REQUEST_TIMEOUT = 10000
 
 function parseJob(value: unknown): CollectionJob {
   if (!value || typeof value !== 'object') throw new Error('收藏服務沒有回傳有效的查詢資料。')
@@ -13,41 +16,151 @@ function parseJob(value: unknown): CollectionJob {
   return job as CollectionJob
 }
 
+function parseUpdate(job: CollectionJob, cursor: number): CollectionJobUpdate {
+  const update = job as Partial<CollectionJobUpdate>
+  if ((update.account !== null && !isCollectionAccount(update.account))
+    || (update.total !== null && (typeof update.total !== 'number' || !Number.isSafeInteger(update.total) || update.total < 0))
+    || !Array.isArray(update.cards) || !update.cards.every(isObjekt)
+    || update.next_cursor !== cursor + update.cards.length
+    || typeof update.has_more !== 'boolean' || (update.has_more && !update.cards.length)) {
+    throw new Error('收藏服務回傳的更新格式不正確。')
+  }
+  if (update.token_ids !== null && (!Array.isArray(update.token_ids)
+    || update.token_ids.length !== update.total || new Set(update.token_ids).size !== update.total
+    || update.token_ids.some(token => typeof token !== 'string' || !/^[0-9]+$/.test(token)))) {
+    throw new Error('持有清單的張數或 Token ID 不符。')
+  }
+  return update as CollectionJobUpdate
+}
+
+function requestSignal(signal: AbortSignal) {
+  return AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT)])
+}
+
+function checkNickname(actual: string, requested: string) {
+  if (actual.toLowerCase() !== requested.toLowerCase()) {
+    throw new Error('回應帳號與輸入的暱稱不一致。')
+  }
+}
+
 export function useCollectionLookup() {
   const isLoading = ref(false)
   const progress = ref('')
   const error = ref('')
+  const preview = shallowRef<CollectionPreview | null>(null)
   let disposed = false
   let controller: AbortController | undefined
+  let sendPriority: ((tokenIds: string[]) => Promise<void>) | undefined
   onScopeDispose(() => { disposed = true; controller?.abort() })
+
+  function prioritize(tokenIds: string[]) {
+    void sendPriority?.(tokenIds)
+  }
 
   async function load(nickname: string): Promise<CollectionSnapshot | null> {
     if (isLoading.value) return null
     error.value = ''
+    preview.value = null
     isLoading.value = true
     progress.value = '正在建立收藏查詢…'
     controller = new AbortController()
+    const signal = controller.signal
+    let tokenIds: string[] | null = null
+    let ownedTokens = new Set<string>()
+    const cards = new Map<string, Objekt>()
+    let cursor = 0
     try {
-      let job = parseJob(await $fetch('/api/collections/sync', {
-        method: 'POST', body: { nickname }, retry: 0, timeout: 10000, signal: controller.signal,
+      const initial = parseJob(await $fetch('/api/collections/sync', {
+        method: 'POST', body: { nickname }, retry: 0, signal: requestSignal(signal),
       }))
-      const deadline = Date.now() + 15 * 60 * 1000
-      while (!disposed) {
-        progress.value = job.progress
-        if (job.status === 'failed') throw new Error(job.error || '收藏讀取失敗，請稍後重試。')
-        if (job.status === 'succeeded') {
-          const snapshot = parseCollectionSnapshot(job.snapshot)
-          if (snapshot.account.nickname.toLowerCase() !== nickname.toLowerCase()) {
-            throw new Error('回應帳號與輸入的暱稱不一致，已保留原收藏。')
+      const jobUrl = `/api/collections/jobs/${initial.job_id}`
+      let pendingPriority: string[] | null = null
+      let sendingPriority = false
+      let lastPriorityKey = ''
+      sendPriority = async (tokenIds) => {
+        const key = tokenIds.join(',')
+        if (key === lastPriorityKey) return
+        lastPriorityKey = key
+        pendingPriority = tokenIds
+        if (sendingPriority) return
+        sendingPriority = true
+        try {
+          // 快速連續翻頁時，等目前請求送完，只補送最後選擇的頁面。
+          while (pendingPriority !== null && !signal.aborted) {
+            const pageTokens = pendingPriority
+            pendingPriority = null
+            try {
+              await $fetch(`${jobUrl}/prioritize`, {
+                method: 'POST', body: { token_ids: pageTokens }, retry: 0, signal: requestSignal(signal),
+              })
+            }
+            catch {
+              // 提示送不出去時，背景仍會依序補齊整份收藏。
+            }
           }
+        }
+        finally {
+          sendingPriority = false
+        }
+      }
+      progress.value = initial.progress
+      let delay = 0
+      while (!disposed) {
+        if (delay) await new Promise(resolve => setTimeout(resolve, delay))
+        if (disposed) return null
+        const job = parseJob(await $fetch(jobUrl, {
+          query: { cursor, include_tokens: tokenIds === null },
+          retry: 2, retryDelay: 750, signal: requestSignal(signal),
+        }))
+        if (disposed) return null
+        progress.value = job.progress
+
+        // 核對後的 Token ID 順序固定。卡片資料可按完成順序抵達。
+        if ('next_cursor' in job) {
+          const update = parseUpdate(job, cursor)
+          if (update.account) checkNickname(update.account.nickname, nickname)
+          if (update.token_ids !== null) {
+            tokenIds = update.token_ids
+            ownedTokens = new Set(tokenIds)
+          }
+          if (update.total === null && tokenIds !== null) {
+            tokenIds = null  // 區塊重驗失敗，撤回暫時顯示的持有清單。
+            ownedTokens.clear()
+            cards.clear()
+          }
+          for (const card of update.cards) {
+            if (!ownedTokens.has(card.external_token_id) || cards.has(card.external_token_id)) {
+              throw new Error('卡片資料與持有清單不符。')
+            }
+            cards.set(card.external_token_id, card)
+          }
+          cursor = update.next_cursor
+          if (update.account && (preview.value?.account.address !== update.account.address
+            || preview.value?.tokenIds !== tokenIds || update.cards.length)) {
+            preview.value = { account: update.account, tokenIds, cards }
+          }
+          if (update.has_more) {
+            delay = 0
+            continue
+          }
+          if (update.status === 'succeeded') {
+            const snapshot = parseCollectionSnapshot({
+              ...(update.result as object),
+              objekts: tokenIds?.map(token => cards.get(token)),
+            })
+            checkNickname(snapshot.account.nickname, nickname)
+            return snapshot
+          }
+        }
+        else if (job.status === 'succeeded') {
+          // 尚未重啟的舊版 API 仍以整份快照回應。
+          const snapshot = parseCollectionSnapshot(job.snapshot)
+          checkNickname(snapshot.account.nickname, nickname)
           return snapshot
         }
-        if (Date.now() > deadline) throw new Error('查詢時間較長，請稍後再次讀取收藏。')
-        await new Promise(resolve => setTimeout(resolve, 1000))
-        if (disposed) return null
-        job = parseJob(await $fetch(`/api/collections/jobs/${job.job_id}`, {
-          retry: 0, timeout: 10000, signal: controller.signal,
-        }))
+
+        if (job.status === 'failed') throw new Error(job.error || '收藏讀取失敗，請稍後重試。')
+        delay = POLL_DELAY
       }
     }
     catch (cause) {
@@ -60,10 +173,12 @@ export function useCollectionLookup() {
       else error.value = cause instanceof Error ? cause.message : '收藏讀取失敗，請稍後重試。'
     }
     finally {
+      sendPriority = undefined
+      controller.abort()
       isLoading.value = false
     }
     return null
   }
 
-  return { isLoading, progress, error, load }
+  return { isLoading, progress, error, preview, load, prioritize }
 }

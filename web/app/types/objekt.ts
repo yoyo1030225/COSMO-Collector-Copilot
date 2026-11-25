@@ -10,8 +10,13 @@ export interface Objekt {
   image_url: string
 }
 
+export interface CollectionAccount {
+  nickname: string
+  address: string
+}
+
 export interface CollectionSnapshot {
-  account: { nickname: string; address: string }
+  account: CollectionAccount
   complete: true
   total: number
   unique_collections: number

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test": "node --test tests/collection-gallery.test.mjs",
     "dev": "nuxt dev --host 127.0.0.1",
     "build": "nuxt build",
     "preview": "nuxt preview --host 127.0.0.1",

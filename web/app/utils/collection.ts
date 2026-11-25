@@ -1,6 +1,13 @@
-import type { CollectionSnapshot, Objekt } from '~/types/objekt'
+import type { CollectionAccount, CollectionSnapshot, Objekt } from '~/types/objekt'
 
-function isObjekt(value: unknown): value is Objekt {
+export function isCollectionAccount(value: unknown): value is CollectionAccount {
+  if (!value || typeof value !== 'object') return false
+  const account = value as Partial<CollectionAccount>
+  return typeof account.nickname === 'string' && !!account.nickname.trim()
+    && typeof account.address === 'string' && /^0x[0-9a-fA-F]{40}$/.test(account.address)
+}
+
+export function isObjekt(value: unknown): value is Objekt {
   if (!value || typeof value !== 'object') return false
   const card = value as Partial<Objekt>
   const fields = ['external_token_id', 'name', 'artist', 'member', 'season', 'collection_code', 'class_name', 'image_url'] as const
@@ -16,10 +23,7 @@ export function parseCollectionSnapshot(value: unknown): CollectionSnapshot {
   const snapshot = value as Partial<CollectionSnapshot>
   if (
     snapshot.complete !== true
-    || typeof snapshot.account?.nickname !== 'string'
-    || !snapshot.account.nickname.trim()
-    || typeof snapshot.account.address !== 'string'
-    || !/^0x[0-9a-fA-F]{40}$/.test(snapshot.account.address)
+    || !isCollectionAccount(snapshot.account)
     || !Array.isArray(snapshot.objekts)
     || !snapshot.objekts.every(isObjekt)
     || !Number.isSafeInteger(snapshot.total)

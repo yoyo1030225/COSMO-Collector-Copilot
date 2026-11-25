@@ -1,20 +1,30 @@
 """將完整鏈上持有清單與官方 metadata 合成可供網頁讀取的快照。"""
 
 import json
+import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
 from tempfile import NamedTemporaryFile
-from urllib.error import HTTPError, URLError
 
 from chain import CHAIN_ID, CONTRACT_ADDRESS, RPC_URL, fetch_owned_tokens, verify_snapshot_block
-from cosmo import BASE_URL, fetch_objekt_metadata, normalize_objekt_metadata
+from cosmo import BASE_URL, fetch_objekt_metadata, normalize_objekt_metadata, open_metadata_connection
+from upstream import RateLimitCooldown, retry_read
 
 
-METADATA_WORKERS = 4
-CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+METADATA_WORKERS = 8
+CACHE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_CACHE = Path(__file__).resolve().parent / "data" / "cosmo-metadata" / str(CHAIN_ID) / CONTRACT_ADDRESS
+logger = logging.getLogger(__name__)
+
+
+class MissingMetadataError(ValueError):
+    def __init__(self, count: int, examples: list[str]):
+        super().__init__(f"{count} 張卡片資料取得失敗，未取代原快照：" + "; ".join(examples))
+        self.count = count
 
 
 def write_json_atomic(path: Path, data: dict) -> None:
@@ -39,7 +49,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _fetch_card(token_id: str, cache_directory: Path) -> dict:
+def _fetch_card(token_id: str, cache_directory: Path, connection=None, *, cooldown=None) -> dict:
     cache_path = cache_directory / f"{token_id}.json"
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -49,46 +59,101 @@ def _fetch_card(token_id: str, cache_directory: Path) -> dict:
     except (OSError, ValueError, KeyError, TypeError):
         pass
 
-    for attempt in range(3):
-        try:
-            raw = fetch_objekt_metadata(token_id)
-            card = normalize_objekt_metadata(token_id, raw)
-            write_json_atomic(cache_path, {"token_id": token_id, "fetched_at": time.time(), "metadata": raw})
-            return card
-        except HTTPError as error:
-            if error.code not in (404, 408, 429, 500, 502, 503, 504) or attempt == 2:
-                raise
-            retry_after = error.headers.get("Retry-After", "") if error.headers else ""
-            delay = min(int(retry_after), 30) if retry_after.isdigit() else 2 ** (attempt + 1)
-        except (URLError, TimeoutError):
-            if attempt == 2:
-                raise
-            delay = 2 ** (attempt + 1)
-        time.sleep(delay)
-    raise ValueError(f"無法取得 Token ID {token_id} 的基本資料。")
+    raw = retry_read(
+        lambda: fetch_objekt_metadata(token_id, connection),
+        retry_not_found=True, cooldown=cooldown,
+    )
+    card = normalize_objekt_metadata(token_id, raw)
+    try:
+        write_json_atomic(cache_path, {"token_id": token_id, "fetched_at": time.time(), "metadata": raw})
+    except OSError:
+        # 已收到有效資料，寫不進可重建的快取不應讓卡片消失。
+        logger.debug("Unable to write metadata cache", exc_info=True)
+    return card
 
 
-def fetch_collection(account: dict, progress=None, cache_directory: Path = DEFAULT_CACHE) -> dict:
-    ownership = fetch_owned_tokens(account["address"], progress)
-    token_ids = ownership["token_ids"]
+def _read_cards(token_ids: list[str], cache_directory: Path, progress, on_card, get_priority) -> dict:
     cards = {}
-    failures = []
-    with ThreadPoolExecutor(max_workers=METADATA_WORKERS) as executor:
-        futures = {executor.submit(_fetch_card, token_id, cache_directory): token_id for token_id in token_ids}
-        for future in as_completed(futures):
-            token_id = futures[future]
-            try:
-                cards[token_id] = future.result()
-            except (HTTPError, URLError, OSError, ValueError) as error:
-                failures.append(f"{token_id} ({error})")
-            completed = len(cards) + len(failures)
-            if progress and (completed % 25 == 0 or completed == len(token_ids)):
-                progress(f"卡片基本資料：{completed}/{len(token_ids)}，失敗 {len(failures)}")
-    if failures:
-        raise ValueError(f"{len(failures)} 張卡片資料取得失敗，未取代原快照：" + "; ".join(failures[:3]))
+    failures = 0
+    examples = []
+    if not token_ids:
+        return cards
 
+    cooldown = RateLimitCooldown()
+    with ExitStack() as stack:
+        connections = Queue()
+        for _ in range(METADATA_WORKERS):
+            connection = open_metadata_connection()
+            if connection is not None:
+                stack.callback(connection.close)
+            connections.put(connection)
+
+        def read(token_id):
+            connection = connections.get_nowait()
+            try:
+                return _fetch_card(token_id, cache_directory, connection, cooldown=cooldown)
+            finally:
+                connections.put(connection)
+
+        executor = stack.enter_context(ThreadPoolExecutor(max_workers=METADATA_WORKERS))
+        remaining = iter(token_ids)
+        unscheduled = set(token_ids)
+        futures = {}
+
+        def schedule_next():
+            if not unscheduled:
+                return
+            priority = get_priority() if get_priority else ()
+            token_id = next((token for token in priority if token in unscheduled), None)
+            if token_id is None:
+                token_id = next(token for token in remaining if token in unscheduled)
+            unscheduled.remove(token_id)
+            futures[executor.submit(read, token_id)] = token_id
+
+        # 只排入能立刻執行的工作，翻頁時下一個空位就能換成新頁面的卡片。
+        for _ in range(METADATA_WORKERS):
+            schedule_next()
+        while futures:
+            finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in finished:
+                token_id = futures.pop(future)
+                try:
+                    card = future.result()
+                except (OSError, ValueError) as error:
+                    failures += 1
+                    if len(examples) < 3:
+                        examples.append(f"{token_id} ({error})")
+                else:
+                    cards[token_id] = card
+                    if on_card:
+                        on_card(card)
+
+                completed = len(cards) + failures
+                if progress and (completed % 25 == 0 or completed == len(token_ids)):
+                    progress(f"卡片資料：{len(cards):,}/{len(token_ids):,}，未取得 {failures:,}")
+                schedule_next()
+
+    if failures:
+        raise MissingMetadataError(failures, examples)
+    return cards
+
+
+def fetch_collection(
+    account: dict, progress=None, cache_directory: Path = DEFAULT_CACHE, *, on_tokens=None, on_card=None, get_priority=None,
+) -> dict:
+    ownership = fetch_owned_tokens(account["address"], progress)
+    token_ids = sorted(ownership["token_ids"], key=int, reverse=True)
+    if on_tokens:
+        verify_snapshot_block(ownership["block_number"], ownership["block_hash"])
+        on_tokens(token_ids)
+    try:
+        cards = _read_cards(token_ids, cache_directory, progress, on_card, get_priority)
+    except MissingMetadataError:
+        if on_tokens:
+            verify_snapshot_block(ownership["block_number"], ownership["block_hash"])
+        raise
     verify_snapshot_block(ownership["block_number"], ownership["block_hash"])
-    ordered = [cards[token_id] for token_id in sorted(token_ids, key=int, reverse=True)]
+    ordered = [cards[token_id] for token_id in token_ids]
     definitions = {(card["artist"], card["season"], card["member"], card["collection_code"]) for card in ordered}
     return {
         "account": account,

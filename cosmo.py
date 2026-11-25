@@ -2,22 +2,21 @@
 
 import json
 import re
+from http.client import HTTPException, HTTPSConnection
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, getproxies, proxy_bypass, urlopen
+
+from upstream import retry_read
 
 
 BASE_URL = "https://api.cosmo.fans"
 TIMEOUT_SECONDS = 20
+REQUEST_HEADERS = {"User-Agent": "COSMO-Collector-Copilot/0.1", "Accept": "application/json"}
 
 
 def _get_json(path: str) -> dict:
-    request = Request(
-        BASE_URL + path,
-        headers={
-            "User-Agent": "COSMO-Collector-Copilot/0.1",
-            "Accept": "application/json",
-        },
-    )
+    request = Request(BASE_URL + path, headers=REQUEST_HEADERS)
     with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
         data = json.load(response)
     if not isinstance(data, dict):
@@ -29,7 +28,8 @@ def fetch_public_account(username: str) -> dict:
     """以暱稱取得公開帳號；回傳暱稱和錢包地址，不包含持有清單。"""
     if not username or username != username.strip():
         raise ValueError("請輸入不含前後空白的 COSMO ID。")
-    data = _get_json(f"/bff/v3/users/by-nickname/{quote(username, safe='')}")
+    path = f"/bff/v3/users/by-nickname/{quote(username, safe='')}"
+    data = retry_read(lambda: _get_json(path))
     nickname = data.get("nickname")
     address = data.get("address")
     if not isinstance(nickname, str) or nickname.casefold() != username.casefold():
@@ -39,11 +39,38 @@ def fetch_public_account(username: str) -> dict:
     return {"nickname": nickname, "address": address}
 
 
-def fetch_objekt_metadata(token_id: str) -> dict:
+def open_metadata_connection() -> HTTPSConnection | None:
+    host = urlparse(BASE_URL).netloc
+    if getproxies().get("https") and not proxy_bypass(host):
+        return None  # 繼續使用 urllib 的系統 HTTPS proxy 設定。
+    return HTTPSConnection(host, timeout=TIMEOUT_SECONDS)
+
+
+def fetch_objekt_metadata(token_id: str, connection: HTTPSConnection | None = None) -> dict:
     """取得指定 Token ID 的 metadata；此資料不能證明目前持有人。"""
     if not re.fullmatch(r"[0-9]+", token_id):
         raise ValueError("Token ID 必須是由數字組成的字串。")
-    return _get_json(f"/bff/v3/objekts/nft-metadata/{token_id}")
+    path = f"/bff/v3/objekts/nft-metadata/{token_id}"
+    if connection is None:
+        return _get_json(path)
+
+    try:
+        connection.request("GET", path, headers=REQUEST_HEADERS)
+        with connection.getresponse() as response:
+            body = response.read()  # 讀完整份回應後才能重用連線。
+            status, reason, headers = response.status, response.reason, response.headers
+    except (HTTPException, OSError) as error:
+        connection.close()  # 重試時由 HTTPSConnection 重新連線。
+        raise URLError(error) from error
+
+    if status in (301, 302, 303, 307, 308):
+        return _get_json(path)
+    if not 200 <= status < 300:
+        raise HTTPError(BASE_URL + path, status, reason, headers, None)
+    data = json.loads(body)
+    if not isinstance(data, dict):
+        raise ValueError("COSMO 沒有回傳預期的 JSON 物件。")
+    return data
 
 
 def normalize_objekt_metadata(token_id: str, raw: dict) -> dict:

@@ -10,7 +10,8 @@ from urllib.error import HTTPError
 from fastapi.testclient import TestClient
 
 from api import create_app
-from collection import write_json_atomic
+from chain import SnapshotBlockChangedError
+from collection import MissingMetadataError, write_json_atomic
 from collection_jobs import CollectionBusyError, CollectionJobs
 
 
@@ -40,9 +41,14 @@ class CollectionJobsTests(unittest.TestCase):
     def test_success_reports_progress_and_saves_by_wallet(self):
         job, _ = self.jobs.create("example")
 
-        def fetch(account, progress):
+        def fetch(account, progress, on_tokens, on_card, get_priority):
             progress("鏈上持有清單：1/1")
-            self.assertEqual(self.jobs.get(job["job_id"])["progress"], "鏈上持有清單：1/1")
+            waiting = self.jobs.get(job["job_id"], cursor=0, include_tokens=True)
+            self.assertEqual(waiting["account"], ACCOUNT)
+            self.assertEqual(waiting["progress"], "鏈上持有清單：1/1")
+            self.assertIsNone(waiting["token_ids"])
+            on_tokens(["123"])
+            on_card(SNAPSHOT["objekts"][0])
             return copy.deepcopy(SNAPSHOT)
 
         with patch("collection_jobs.fetch_public_account", return_value=ACCOUNT), patch("collection_jobs.fetch_collection", side_effect=fetch):
@@ -70,6 +76,26 @@ class CollectionJobsTests(unittest.TestCase):
         self.assertIn("找不到 COSMO 暱稱", self.jobs.get(job["job_id"])["error"])
         self.assertEqual(self.jobs.get(job["job_id"])["status"], "failed")
         self.jobs.create("next-user")
+
+    def test_exposes_verified_ids_when_metadata_is_missing_but_withdraws_changed_block(self):
+        write_json_atomic(self.directory / "latest.json", SNAPSHOT)
+        for error, expected in ((MissingMetadataError(1, []), ("123", "124")), (SnapshotBlockChangedError("reorg"), None)):
+            with self.subTest(error=error):
+                job, _ = self.jobs.create("example")
+
+                def fetch(account, progress, on_tokens, on_card, get_priority):
+                    on_tokens(["123", "124"])
+                    on_card(SNAPSHOT["objekts"][0])
+                    raise error
+
+                with patch("collection_jobs.fetch_public_account", return_value=ACCOUNT), patch("collection_jobs.fetch_collection", side_effect=fetch):
+                    self.jobs.run(job["job_id"])
+                state = self.jobs.get(job["job_id"], cursor=0, include_tokens=True)
+                self.assertEqual(state["status"], "failed")
+                self.assertEqual(state["token_ids"], expected)
+                self.assertEqual(state["cards"], SNAPSHOT["objekts"] if expected else [])
+                self.assertIsNone(state["result"])
+                self.assertEqual(self.jobs.latest(), SNAPSHOT)
 
 
 class ApiTests(unittest.TestCase):
@@ -101,9 +127,71 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/collections/jobs/" + "0" * 32).status_code, 404)
         self.assertEqual(self.client.get("/collections/latest").status_code, 404)
 
+    def test_large_collection_is_transferred_in_limited_updates_without_missing_entries(self):
+        ids = list(map(str, range(10001, 0, -1)))
+        records = [{"external_token_id": identifier} for identifier in ids]
+
+        def fetch(account, progress, on_tokens, on_card, get_priority):
+            on_tokens(ids)
+            for card in records:
+                on_card(card)
+            return {**SNAPSHOT, "total": len(records), "objekts": records}
+
+        with patch("collection_jobs.fetch_public_account", return_value=ACCOUNT), patch("collection_jobs.fetch_collection", side_effect=fetch):
+            created = self.client.post("/collections/sync", json={"nickname": "example"})
+        url = "/collections/jobs/" + created.json()["job_id"]
+        cursor = 0
+        downloaded = []
+        while True:
+            response = self.client.get(url, params={"cursor": cursor, "include_tokens": cursor == 0})
+            self.assertEqual(response.status_code, 200)
+            update = response.json()
+            self.assertNotIn("snapshot", update)
+            self.assertNotIn("objekts", update["result"])
+            self.assertEqual(update["token_ids"], ids if cursor == 0 else None)
+            self.assertLessEqual(len(update["cards"]), 300)
+            downloaded.extend(update["cards"])
+            self.assertEqual(update["next_cursor"], len(downloaded))
+            if not update["has_more"]:
+                break
+            self.assertGreater(update["next_cursor"], cursor)
+            cursor = update["next_cursor"]
+        self.assertEqual(downloaded, records)
+        self.assertEqual(update["result"]["total"], 10001)
+
     def test_other_active_query_returns_409(self):
         self.jobs.create("first")
         self.assertEqual(self.client.post("/collections/sync", json={"nickname": "second"}).status_code, 409)
+
+    def test_accepts_only_verified_tokens_when_prioritizing_the_current_page(self):
+        job, _ = self.jobs.create("example")
+        job_id = job["job_id"]
+        url = f"/collections/jobs/{job_id}/prioritize"
+
+        def fetch(account, progress, on_tokens, on_card, get_priority):
+            self.assertEqual(self.client.post(url, json={"token_ids": ["123"]}).status_code, 204)
+            self.assertEqual(get_priority(), ())
+            on_tokens(["123", "124"])
+            self.assertEqual(self.client.post(url, json={"token_ids": ["124", "999", "123"]}).status_code, 204)
+            self.assertEqual(get_priority(), ("124", "123"))
+            self.assertEqual(self.client.post(url, json={"token_ids": ["123"]}).status_code, 204)
+            self.assertEqual(get_priority(), ("123",))
+            self.assertEqual(self.client.post(url, json={"token_ids": []}).status_code, 204)
+            self.assertEqual(get_priority(), ())
+            records = [{"external_token_id": token} for token in ("123", "124")]
+            for record in records:
+                on_card(record)
+            return {**SNAPSHOT, "total": len(records), "objekts": records}
+
+        with patch("collection_jobs.fetch_public_account", return_value=ACCOUNT), patch(
+            "collection_jobs.fetch_collection", side_effect=fetch,
+        ):
+            self.jobs.run(job_id)
+        self.assertEqual(self.jobs.get(job_id)["status"], "succeeded")
+        self.assertEqual(self.client.post("/collections/jobs/" + "0" * 32 + "/prioritize", json={"token_ids": []}).status_code, 404)
+        for ids in ([123], ["-1"], ["1\n"], ["1" * 79], ["1"] * 61):
+            with self.subTest(ids=ids):
+                self.assertEqual(self.client.post(url, json={"token_ids": ids}).status_code, 422)
 
 
 class AtomicWriteTests(unittest.TestCase):
